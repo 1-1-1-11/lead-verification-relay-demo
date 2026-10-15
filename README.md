@@ -1,8 +1,8 @@
 # lead-verification-relay-demo
 
-询盘从表格领出来，背调完写回去，中间做身份校验。写错行、发错信成本很高，所以对不上就整批拒、服务停，等人来看。
+询盘从表格领取，背调结果写回原行，写回前做身份核对。核对不一致时本批不写入，相关行标为异常，服务进入暂停，等人工看过再恢复。
 
-这是生产系统的脱敏版：安全边界留着，Google Sheets / ChatGPT 网页都换成本地假数据，没有客户信息和密钥。
+生产系统的脱敏版：校验与暂停逻辑保留，Google Sheets / ChatGPT 网页换成本地假数据，不含客户信息和密钥。
 
 ## 怎么跑
 
@@ -15,7 +15,7 @@ pytest -q
 uvicorn relay_demo.app:app --port 8017
 ```
 
-浏览器开 <http://127.0.0.1:8017/> 看监控台。
+浏览器开 <http://127.0.0.1:8017/> 看工作台。
 
 走一遍：
 
@@ -33,7 +33,7 @@ python -m relay_demo.demo_flow --tamper
 curl -X POST http://127.0.0.1:8017/api/ops/resume
 ```
 
-![监控台](assets/dashboard.png)
+![询盘背调工作台](assets/dashboard.png)
 
 ## 为什么要停
 

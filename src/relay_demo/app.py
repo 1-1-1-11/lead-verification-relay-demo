@@ -136,73 +136,156 @@ def resume() -> dict:
     return {"resumed": True}
 
 
-# 只读监控台：偏值班台，不做成演示首页
+# 只读工作台：浅色运营后台，展示队列 / 单条核对 / 停机原因
 _DASHBOARD = """<!doctype html>
 <html lang="zh"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>relay · ops</title>
+<title>询盘背调</title>
 <style>
 :root {
-  --bg:#111315; --panel:#181b1e; --line:#2a2f35; --text:#c8ced6;
-  --muted:#7a8490; --ok:#6fba8a; --bad:#d17a72; --warn:#c9a45c;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg:#f5f6f8; --panel:#fff; --line:#e5e7eb; --text:#111827;
+  --muted:#6b7280; --ok:#15803d; --ok-bg:#f0fdf4; --bad:#b91c1c;
+  --bad-bg:#fef2f2; --warn:#b45309; --warn-bg:#fffbeb; --soft:#f9fafb;
+  --sans:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",
+         "Segoe UI",system-ui,sans-serif;
 }
-*{box-sizing:border-box;margin:0}
-body{background:var(--bg);color:var(--text);font:13px/1.45 var(--mono);padding:0}
-.top{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
-.brand{font-weight:600;letter-spacing:.2px}
-.sep{color:var(--line)}
-.pill{padding:2px 8px;border:1px solid var(--line);border-radius:3px;color:var(--muted);font-size:12px}
-.pill.on{border-color:#2f5a40;color:var(--ok);background:#142019}
-.pill.off{border-color:#5a2f2f;color:var(--bad);background:#221616}
-.main{padding:14px 16px 28px;max-width:980px}
-.grid{display:grid;grid-template-columns:180px 1fr;gap:14px;margin-bottom:16px}
-.stat{background:var(--panel);border:1px solid var(--line);padding:10px 12px}
-.stat .k{color:var(--muted);font-size:11px;margin-bottom:6px}
-.stat .v{font-size:20px;font-weight:600}
-.stat .v.bad{color:var(--bad)}
-.stat .v.warn{color:var(--warn)}
-h2{font-size:12px;color:var(--muted);font-weight:500;margin:18px 0 8px;text-transform:uppercase;letter-spacing:.6px}
-table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}
-th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:500;font-size:11px;background:#15181b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.5 var(--sans)}
+.top{
+  display:flex;align-items:center;gap:10px;padding:12px 20px;
+  background:var(--panel);border-bottom:1px solid var(--line);
+}
+.brand{font-weight:600;font-size:14px}
+.sep{color:#d1d5db}
+.mute{color:var(--muted)}
+.pill{
+  margin-left:auto;font-size:12px;padding:3px 10px;border-radius:999px;
+  border:1px solid var(--line);background:var(--soft);color:var(--muted);
+}
+.pill.on{color:var(--ok);border-color:#bbf7d0;background:var(--ok-bg)}
+.pill.off{color:var(--bad);border-color:#fecaca;background:var(--bad-bg)}
+.wrap{max-width:1080px;margin:0 auto;padding:18px 20px 32px}
+.banner{
+  margin-bottom:14px;padding:10px 14px;border-radius:8px;
+  border:1px solid #fecaca;background:var(--bad-bg);color:var(--bad);
+  font-size:13px;
+}
+.banner code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--text)}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.stat{
+  background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:12px 14px;
+}
+.stat .k{font-size:12px;color:var(--muted);margin-bottom:4px}
+.stat .v{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.stat .v.ok{color:var(--ok)} .stat .v.bad{color:var(--bad)}
+.grid{display:grid;grid-template-columns:1.35fr .85fr;gap:14px}
+.panel{
+  background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:14px 16px;margin-bottom:14px;
+}
+.panel h2{
+  font-size:13px;font-weight:600;margin-bottom:10px;
+  display:flex;align-items:center;justify-content:space-between;
+}
+.panel h2 .hint{font-weight:400;color:var(--muted);font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:8px 6px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:500;font-size:12px}
 tr:last-child td{border-bottom:none}
 .num{text-align:right;font-variant-numeric:tabular-nums}
-.ok{color:var(--ok)} .bad{color:var(--bad)} .mute{color:var(--muted)}
-.banner{margin:0 0 14px;padding:8px 10px;border:1px solid #5a2f2f;background:#1c1414;color:var(--bad)}
-.banner code{color:var(--text)}
-.foot{margin-top:16px;color:var(--muted);font-size:11px}
+.tag{
+  display:inline-block;font-size:12px;padding:1px 8px;border-radius:999px;
+  border:1px solid var(--line);background:var(--soft);color:var(--muted);
+}
+.tag.done{color:var(--ok);border-color:#bbf7d0;background:var(--ok-bg)}
+.tag.proc{color:var(--warn);border-color:#fde68a;background:var(--warn-bg)}
+.tag.fail{color:var(--bad);border-color:#fecaca;background:var(--bad-bg)}
+.tag.wait{color:var(--muted)}
+.detail .row{display:grid;grid-template-columns:64px 1fr;gap:6px;margin:6px 0;font-size:13px}
+.detail .k{color:var(--muted)}
+.detail .box{
+  margin-top:8px;padding:10px 12px;background:var(--soft);
+  border:1px solid var(--line);border-radius:6px;font-size:13px;color:#374151;
+}
+.ok{color:var(--ok)} .bad{color:var(--bad)}
+.foot{margin-top:8px;color:var(--muted);font-size:12px}
+@media (max-width:860px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .grid{grid-template-columns:1fr}
+}
 </style>
 </head><body>
 <div class="top">
-  <div class="brand">relay</div>
-  <span class="sep">/</span>
-  <div>询盘背调</div>
+  <div class="brand">询盘背调</div>
   <span class="sep">·</span>
-  <div class="mute" style="color:var(--muted)">只读</div>
-  <div style="flex:1"></div>
+  <div class="mute" style="font-size:13px">本地演示 · 只读</div>
   __STATUS__
 </div>
-<div class="main">
+<div class="wrap">
 __BANNER__
-<div class="grid">
+<div class="stats">
   <div class="stat"><div class="k">待处理</div><div class="v">__PENDING__</div></div>
-  <div class="stat"><div class="k">处理中 / 已背调 / 异常</div><div class="v">__PROC__ <span class="mute">/</span> <span class="ok">__DONE__</span> <span class="mute">/</span> <span class="__FAIL_CLASS__">__FAIL__</span></div></div>
+  <div class="stat"><div class="k">处理中</div><div class="v">__PROC__</div></div>
+  <div class="stat"><div class="k">已背调</div><div class="v ok">__DONE__</div></div>
+  <div class="stat"><div class="k">异常</div><div class="v __FAIL_CLASS__">__FAIL__</div></div>
 </div>
-<h2>客户队列</h2>
-<table>
-  <tr><th>客户</th><th class="num">待处理</th><th class="num">处理中</th><th class="num">已背调</th><th class="num">异常</th></tr>
-  __ROWS__
-</table>
-<h2>最近事件 · 无 PII</h2>
-<table>
-  <tr><th>时间</th><th>阶段</th><th>客户</th><th class="num">行</th><th>结果</th></tr>
-  __EVENTS__
-</table>
-<div class="foot">demo 本地假表 · 写回前四重身份校验 · 对不上整批拒、全局停</div>
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>询盘队列 <span class="hint">同一客户成批领取</span></h2>
+      <table>
+        <tr>
+          <th class="num">行</th><th>客户</th><th>产品</th><th>国家</th><th>状态</th><th>等级</th>
+        </tr>
+        __LEAD_ROWS__
+      </table>
+    </div>
+    <div class="panel">
+      <h2>最近动态 <span class="hint">不含正文与 PII</span></h2>
+      <table>
+        <tr><th>时间</th><th>阶段</th><th>客户</th><th class="num">行</th><th>结果</th></tr>
+        __EVENTS__
+      </table>
+    </div>
+  </div>
+  <div>
+    <div class="panel">
+      <h2>最近一条核对 <span class="hint">已写回的询盘</span></h2>
+      __DETAIL__
+    </div>
+    <div class="panel">
+      <h2>写回约定</h2>
+      <div class="detail">
+        <div class="row"><span class="k">核对</span><span>写回前比对客户、任务、行号与指纹</span></div>
+        <div class="row"><span class="k">不一致</span><span>本批不写入，行标为异常，服务进入暂停</span></div>
+        <div class="row"><span class="k">可写列</span><span>analysis / lead_level / source_url / verified_time</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="foot">本地假表演示 · 正式环境对接 Google Sheet 与网页 ChatGPT</div>
 </div>
 </body></html>"""
+
+
+_STAGE_CN = {
+    "batch_claimed": "领取批次",
+    "row_written": "写回成功",
+    "batch_rejected": "整批拒回",
+    "manual_resume": "人工恢复",
+}
+
+
+def _status_tag(status: str) -> str:
+    if status == "已背调":
+        return '<span class="tag done">已背调</span>'
+    if status == "处理中":
+        return '<span class="tag proc">处理中</span>'
+    if status == "背调异常":
+        return '<span class="tag fail">异常</span>'
+    return '<span class="tag wait">待处理</span>'
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -216,29 +299,57 @@ def dashboard() -> str:
     if state["paused"]:
         status = '<span class="pill off">已暂停</span>'
         banner = (
-            f'<div class="banner">全局人工暂停：{state["pause_reason"]} · '
-            f'恢复 <code>POST /api/ops/resume</code></div>'
+            f'<div class="banner">本批身份核对未通过，结果未写入：'
+            f'{state["pause_reason"]} · 恢复 <code>POST /api/ops/resume</code></div>'
         )
     else:
         status = '<span class="pill on">运行中</span>'
         banner = ""
 
-    rows = "".join(
-        f"<tr><td>{cid}</td>"
-        f"<td class='num'>{s['pending']}</td>"
-        f"<td class='num'>{s['processing']}</td>"
-        f"<td class='num ok'>{s['done']}</td>"
-        f"<td class='num bad'>{s['failed']}</td></tr>"
-        for cid, s in stats.items()
-    ) or "<tr><td colspan='5' class='mute'>暂无客户</td></tr>"
+    lead_rows = "".join(
+        f"<tr>"
+        f"<td class='num'>{r.row_number}</td>"
+        f"<td>{r.customer_id}</td>"
+        f"<td>{r.product}</td>"
+        f"<td>{r.country}</td>"
+        f"<td>{_status_tag(r.status)}</td>"
+        f"<td>{r.lead_level or '—'}</td>"
+        f"</tr>"
+        for r in sorted(store.rows.values(), key=lambda x: x.row_number)
+    ) or "<tr><td colspan='6' class='mute'>暂无询盘</td></tr>"
+
+    verified = [r for r in store.rows.values() if r.status == "已背调" and r.analysis]
+    if verified:
+        sample = sorted(verified, key=lambda r: r.row_number)[-1]
+        detail = (
+            f'<div class="detail">'
+            f'<div class="row"><span class="k">客户</span><span>{sample.customer_id}</span></div>'
+            f'<div class="row"><span class="k">行号</span><span>{sample.row_number}</span></div>'
+            f'<div class="row"><span class="k">产品</span><span>{sample.product} · {sample.quantity}</span></div>'
+            f'<div class="row"><span class="k">等级</span><span class="ok">{sample.lead_level}</span></div>'
+            f'<div class="row"><span class="k">状态</span><span>已背调 · 指纹核对通过</span></div>'
+            f'<div class="box">{sample.analysis}</div>'
+            f'</div>'
+        )
+    elif state["paused"]:
+        detail = (
+            '<div class="detail">'
+            '<div class="row"><span class="k">结果</span><span class="bad">整批拒回</span></div>'
+            f'<div class="row"><span class="k">原因</span><span>{state["pause_reason"]}</span></div>'
+            '<div class="box">源行指纹与领取时不一致，可能是表格在处理期间被改过。'
+            '本批背调结果未写入；核对表格后可恢复服务。</div>'
+            '</div>'
+        )
+    else:
+        detail = '<p class="mute" style="font-size:13px">领取并写回后，这里会显示单条核对结果。</p>'
 
     evts = "".join(
         f"<tr><td class='mute'>{time.strftime('%H:%M:%S', time.localtime(e.get('ts', 0)))}</td>"
-        f"<td>{e.get('stage', '')}</td>"
+        f"<td>{_STAGE_CN.get(e.get('stage', ''), e.get('stage', ''))}</td>"
         f"<td>{e.get('customer_id', '') or '—'}</td>"
         f"<td class='num'>{e.get('row_number', '') or '—'}</td>"
         f"<td>{e.get('result', '') or e.get('detail', '') or '—'}</td></tr>"
-        for e in reversed(events.tail(20))
+        for e in reversed(events.tail(12))
     ) or "<tr><td colspan='5' class='mute'>还没有事件</td></tr>"
 
     return (
@@ -249,7 +360,8 @@ def dashboard() -> str:
         .replace("__PROC__", str(processing))
         .replace("__DONE__", str(done))
         .replace("__FAIL__", str(failed))
-        .replace("__FAIL_CLASS__", "bad" if failed else "mute")
-        .replace("__ROWS__", rows)
+        .replace("__FAIL_CLASS__", "bad" if failed else "")
+        .replace("__LEAD_ROWS__", lead_rows)
         .replace("__EVENTS__", evts)
+        .replace("__DETAIL__", detail)
     )
