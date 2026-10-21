@@ -3,29 +3,48 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from . import __version__
+from .config import settings
 from .events import EventLog
 from .models import AnalysisResult, Batch, ClaimedItem
 from .store import FakeSheetStore
 from .verify import IdentityMismatch, compute_fingerprint, verify_identity
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 store = FakeSheetStore()
-events = EventLog(DATA_DIR / "relay-events.jsonl")
+events = EventLog(
+    settings.data_dir / "relay-events.jsonl",
+    max_bytes=settings.event_log_max_bytes,
+    backups=settings.event_log_backups,
+)
 
-state: dict = {
+state: dict[str, Any] = {
     "paused": False,
     "pause_reason": "",
     "batches": {},
+    "closed_jobs": set(),
     "heartbeat": time.time(),
 }
+
+
+def reset_runtime() -> None:
+    """测试用:回到种子数据,并清空暂停、批次和事件日志。"""
+    state["paused"] = False
+    state["pause_reason"] = ""
+    state["batches"].clear()
+    state["closed_jobs"].clear()
+    state["heartbeat"] = time.time()
+    store.rows = FakeSheetStore().rows
+    events.clear()
 
 
 async def _heartbeat() -> None:
@@ -36,51 +55,99 @@ async def _heartbeat() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    state["heartbeat"] = time.time()
     task = asyncio.create_task(_heartbeat())
-    yield
-    task.cancel()
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
-app = FastAPI(title="Lead Verification Relay Demo", lifespan=lifespan)
+app = FastAPI(
+    title="Lead Verification Relay Demo",
+    version=__version__,
+    lifespan=lifespan,
+)
+
+
+def _monitor_lag() -> float:
+    return time.time() - state["heartbeat"]
 
 
 @app.get("/healthz")
 def healthz() -> dict:
-    monitor_lag = round(time.time() - state["heartbeat"], 1)
+    monitor_lag = _monitor_lag()
     return {
         "web": "ok",
-        "monitor": {"alive": monitor_lag < 15, "lag_seconds": monitor_lag},
+        "version": __version__,
+        "monitor": {
+            "alive": monitor_lag < settings.monitor_max_lag_seconds,
+            "lag_seconds": round(monitor_lag, 1),
+        },
         "paused": state["paused"],
         "pause_reason": state["pause_reason"],
     }
 
 
 @app.post("/api/batches/claim", response_model=Batch)
-def claim_batch(batch_size: int = 3) -> Batch:
+def claim_batch(batch_size: int | None = None) -> Batch:
     if state["paused"]:
         raise HTTPException(status_code=423, detail=f"全局人工暂停中:{state['pause_reason']}")
+    if _monitor_lag() >= settings.monitor_max_lag_seconds:
+        raise HTTPException(status_code=503, detail="监控心跳停滞，已停止领取新批次")
+    size = settings.default_batch_size if batch_size is None else batch_size
+    if size < 1 or size > settings.max_batch_size:
+        raise HTTPException(
+            status_code=422,
+            detail=f"batch_size 必须在 1 到 {settings.max_batch_size} 之间",
+        )
     customers = store.claimable_customers()
     if not customers:
         raise HTTPException(status_code=404, detail="没有待处理询盘")
 
     customer_id = customers[0]
-    rows = store.claim(customer_id, batch_size)
+    rows = store.claim(customer_id, size, max_batch_size=settings.max_batch_size)
+    if not rows:
+        raise HTTPException(status_code=404, detail="没有待处理询盘")
     job_id = uuid.uuid4().hex[:12]
     items = [
         ClaimedItem(
             job_id=job_id,
             task_id=uuid.uuid4().hex[:12],
             customer_id=customer_id,
-            row_number=r.row_number,
-            fingerprint=compute_fingerprint(r),
+            row_number=row.row_number,
+            fingerprint=compute_fingerprint(row),
         )
-        for r in rows
+        for row in rows
     ]
     batch = Batch(job_id=job_id, customer_id=customer_id, items=items)
     state["batches"][job_id] = batch
-    events.append(stage="batch_claimed", job_id=job_id, customer_id=customer_id,
-                  detail=f"{len(items)} rows")
+    events.append(
+        stage="batch_claimed",
+        job_id=job_id,
+        customer_id=customer_id,
+        detail=f"rows={len(items)}",
+    )
     return batch
+
+
+def _reject_batch(job_id: str, batch: Batch, mismatches: list[dict[str, object]]) -> None:
+    for item in batch.items:
+        store.mark_failed(item.row_number)
+    state["paused"] = True
+    state["pause_reason"] = f"批次 {job_id} 身份校验失败,需人工核对"
+    state["closed_jobs"].add(job_id)
+    events.append(
+        stage="batch_rejected",
+        job_id=job_id,
+        customer_id=batch.customer_id,
+        result="global_pause",
+        detail=str(mismatches)[:200],
+    )
 
 
 @app.post("/api/batches/{job_id}/writeback")
@@ -88,12 +155,16 @@ def writeback(job_id: str, results: list[AnalysisResult]) -> JSONResponse:
     batch = state["batches"].get(job_id)
     if batch is None:
         raise HTTPException(status_code=404, detail="未知批次")
+    if job_id in state["closed_jobs"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "batch_closed", "action": "该批次已结束，不能再次写回"},
+        )
     if state["paused"]:
         raise HTTPException(status_code=423, detail=f"全局人工暂停中:{state['pause_reason']}")
 
     claimed_by_task = {item.task_id: item for item in batch.items}
-
-    mismatches = []
+    mismatches: list[dict[str, object]] = []
     for result in results:
         claimed = claimed_by_task.get(result.task_id)
         if claimed is None:
@@ -101,30 +172,61 @@ def writeback(job_id: str, results: list[AnalysisResult]) -> JSONResponse:
             continue
         try:
             verify_identity(claimed, result)
+            row = store.rows.get(claimed.row_number)
+            if row is None or compute_fingerprint(row) != claimed.fingerprint:
+                raise IdentityMismatch("fingerprint", claimed.row_number)
         except IdentityMismatch as exc:
             mismatches.append({"row_number": exc.row_number, "field": exc.field})
 
     if mismatches:
-        for item in batch.items:
-            store.mark_failed(item.row_number)
-        state["paused"] = True
-        state["pause_reason"] = f"批次 {job_id} 身份校验失败,需人工核对"
-        events.append(stage="batch_rejected", job_id=job_id, customer_id=batch.customer_id,
-                      result="global_pause", detail=str(mismatches)[:200])
-        raise HTTPException(status_code=409, detail={
-            "error": "identity_mismatch", "mismatches": mismatches,
-            "action": "整批未写回,已进入全局人工暂停",
-        })
+        _reject_batch(job_id, batch, mismatches)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "identity_mismatch",
+                "mismatches": mismatches,
+                "action": "整批未写回,已进入全局人工暂停",
+            },
+        )
+
+    claimed_ids = {item.task_id for item in batch.items}
+    result_ids = [result.task_id for result in results]
+    if len(result_ids) != len(claimed_ids) or set(result_ids) != claimed_ids:
+        events.append(
+            stage="batch_incomplete",
+            job_id=job_id,
+            customer_id=batch.customer_id,
+            result="rejected",
+            detail=f"expected {len(claimed_ids)} got {len(result_ids)}",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "incomplete_batch",
+                "expected": len(claimed_ids),
+                "received": len(result_ids),
+                "action": "结果必须覆盖本批全部任务且不能重复；本次未写回，服务未暂停",
+            },
+        )
 
     for result in results:
-        store.write_back(result.row_number, {
-            "analysis": result.analysis,
-            "lead_level": result.lead_level,
-            "source_url": result.source_url,
-        })
-        events.append(stage="row_written", job_id=job_id, task_id=result.task_id,
-                      customer_id=result.customer_id, row_number=result.row_number,
-                      result=result.lead_level)
+        store.write_back(
+            result.row_number,
+            {
+                "analysis": result.analysis,
+                "lead_level": result.lead_level,
+                "source_url": result.source_url,
+            },
+        )
+        events.append(
+            stage="row_written",
+            job_id=job_id,
+            task_id=result.task_id,
+            customer_id=result.customer_id,
+            row_number=result.row_number,
+            result=result.lead_level,
+        )
+    state["closed_jobs"].add(job_id)
     return JSONResponse({"written": len(results), "job_id": job_id})
 
 
@@ -258,9 +360,7 @@ __BANNER__
     <div class="panel">
       <h2>写回约定</h2>
       <div class="detail">
-        <div class="row"><span class="k">核对</span><span>写回前比对客户、任务、行号与指纹</span></div>
-        <div class="row"><span class="k">不一致</span><span>本批不写入，行标为异常，服务进入暂停</span></div>
-        <div class="row"><span class="k">可写列</span><span>analysis / lead_level / source_url / verified_time</span></div>
+        __RULES__
       </div>
     </div>
   </div>
@@ -269,99 +369,152 @@ __BANNER__
 </div>
 </body></html>"""
 
+_PLACEHOLDER = re.compile(r"__([A-Z0-9_]+)__")
 
 _STAGE_CN = {
     "batch_claimed": "领取批次",
     "row_written": "写回成功",
     "batch_rejected": "整批拒回",
+    "batch_incomplete": "批次不完整",
     "manual_resume": "人工恢复",
 }
 
+_DASHBOARD_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+        "base-uri 'none'; form-action 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+def _esc(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _fill(template: str, values: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return values.get(match.group(1), match.group(0))
+
+    return _PLACEHOLDER.sub(replace, template)
+
+
+def _kv(label: str, value: str, value_class: str = "") -> str:
+    klass = f' class="{value_class}"' if value_class else ""
+    return f'<div class="row"><span class="k">{label}</span><span{klass}>{value}</span></div>'
+
 
 def _status_tag(status: str) -> str:
+    safe = _esc(status)
     if status == "已背调":
-        return '<span class="tag done">已背调</span>'
+        return f'<span class="tag done">{safe}</span>'
     if status == "处理中":
-        return '<span class="tag proc">处理中</span>'
+        return f'<span class="tag proc">{safe}</span>'
     if status == "背调异常":
-        return '<span class="tag fail">异常</span>'
-    return '<span class="tag wait">待处理</span>'
+        return f'<span class="tag fail">{safe}</span>'
+    return f'<span class="tag wait">{safe or "待处理"}</span>'
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
+def dashboard() -> HTMLResponse:
     stats = store.stats()
-    pending = sum(s["pending"] for s in stats.values())
-    processing = sum(s["processing"] for s in stats.values())
-    done = sum(s["done"] for s in stats.values())
-    failed = sum(s["failed"] for s in stats.values())
+    pending = sum(item["pending"] for item in stats.values())
+    processing = sum(item["processing"] for item in stats.values())
+    done = sum(item["done"] for item in stats.values())
+    failed = sum(item["failed"] for item in stats.values())
 
     if state["paused"]:
         status = '<span class="pill off">已暂停</span>'
         banner = (
-            f'<div class="banner">本批身份核对未通过，结果未写入：'
-            f'{state["pause_reason"]} · 恢复 <code>POST /api/ops/resume</code></div>'
+            '<div class="banner">本批身份核对未通过，结果未写入：'
+            f"{_esc(state['pause_reason'])} · 恢复 <code>POST /api/ops/resume</code></div>"
         )
     else:
         status = '<span class="pill on">运行中</span>'
         banner = ""
 
-    lead_rows = "".join(
-        f"<tr>"
-        f"<td class='num'>{r.row_number}</td>"
-        f"<td>{r.customer_id}</td>"
-        f"<td>{r.product}</td>"
-        f"<td>{r.country}</td>"
-        f"<td>{_status_tag(r.status)}</td>"
-        f"<td>{r.lead_level or '—'}</td>"
-        f"</tr>"
-        for r in sorted(store.rows.values(), key=lambda x: x.row_number)
-    ) or "<tr><td colspan='6' class='mute'>暂无询盘</td></tr>"
+    lead_rows = (
+        "".join(
+            "<tr>"
+            f"<td class='num'>{_esc(row.row_number)}</td>"
+            f"<td>{_esc(row.customer_id)}</td>"
+            f"<td>{_esc(row.product)}</td>"
+            f"<td>{_esc(row.country)}</td>"
+            f"<td>{_status_tag(row.status)}</td>"
+            f"<td>{_esc(row.lead_level or '—')}</td>"
+            "</tr>"
+            for row in sorted(store.rows.values(), key=lambda item: item.row_number)
+        )
+        or "<tr><td colspan='6' class='mute'>暂无询盘</td></tr>"
+    )
 
-    verified = [r for r in store.rows.values() if r.status == "已背调" and r.analysis]
+    verified = [row for row in store.rows.values() if row.status == "已背调" and row.analysis]
     if verified:
-        sample = sorted(verified, key=lambda r: r.row_number)[-1]
+        sample = sorted(verified, key=lambda row: row.row_number)[-1]
+        product = f"{_esc(sample.product)} · {_esc(sample.quantity)}"
         detail = (
-            f'<div class="detail">'
-            f'<div class="row"><span class="k">客户</span><span>{sample.customer_id}</span></div>'
-            f'<div class="row"><span class="k">行号</span><span>{sample.row_number}</span></div>'
-            f'<div class="row"><span class="k">产品</span><span>{sample.product} · {sample.quantity}</span></div>'
-            f'<div class="row"><span class="k">等级</span><span class="ok">{sample.lead_level}</span></div>'
-            f'<div class="row"><span class="k">状态</span><span>已背调 · 指纹核对通过</span></div>'
-            f'<div class="box">{sample.analysis}</div>'
-            f'</div>'
+            '<div class="detail">'
+            + _kv("客户", _esc(sample.customer_id))
+            + _kv("行号", _esc(sample.row_number))
+            + _kv("产品", product)
+            + _kv("等级", _esc(sample.lead_level), "ok")
+            + _kv("状态", "已背调 · 指纹核对通过")
+            + f'<div class="box">{_esc(sample.analysis)}</div>'
+            + "</div>"
         )
     elif state["paused"]:
         detail = (
             '<div class="detail">'
-            '<div class="row"><span class="k">结果</span><span class="bad">整批拒回</span></div>'
-            f'<div class="row"><span class="k">原因</span><span>{state["pause_reason"]}</span></div>'
-            '<div class="box">源行指纹与领取时不一致，可能是表格在处理期间被改过。'
-            '本批背调结果未写入；核对表格后可恢复服务。</div>'
-            '</div>'
+            + _kv("结果", "整批拒回", "bad")
+            + _kv("原因", _esc(state["pause_reason"]))
+            + '<div class="box">源行指纹与领取时不一致，可能是表格在处理期间被改过。'
+            + "本批背调结果未写入；核对表格后可恢复服务。</div>"
+            + "</div>"
         )
     else:
         detail = '<p class="mute" style="font-size:13px">领取并写回后，这里会显示单条核对结果。</p>'
 
-    evts = "".join(
-        f"<tr><td class='mute'>{time.strftime('%H:%M:%S', time.localtime(e.get('ts', 0)))}</td>"
-        f"<td>{_STAGE_CN.get(e.get('stage', ''), e.get('stage', ''))}</td>"
-        f"<td>{e.get('customer_id', '') or '—'}</td>"
-        f"<td class='num'>{e.get('row_number', '') or '—'}</td>"
-        f"<td>{e.get('result', '') or e.get('detail', '') or '—'}</td></tr>"
-        for e in reversed(events.tail(12))
-    ) or "<tr><td colspan='5' class='mute'>还没有事件</td></tr>"
+    def _event_row(event: dict) -> str:
+        stamp = time.strftime("%H:%M:%S", time.localtime(event.get("ts", 0)))
+        stage = _STAGE_CN.get(event.get("stage", ""), event.get("stage", ""))
+        customer = event.get("customer_id", "") or "—"
+        row_number = event.get("row_number", "") or "—"
+        outcome = event.get("result", "") or event.get("detail", "") or "—"
+        return (
+            "<tr>"
+            f"<td class='mute'>{_esc(stamp)}</td>"
+            f"<td>{_esc(stage)}</td>"
+            f"<td>{_esc(customer)}</td>"
+            f"<td class='num'>{_esc(row_number)}</td>"
+            f"<td>{_esc(outcome)}</td>"
+            "</tr>"
+        )
 
-    return (
-        _DASHBOARD
-        .replace("__STATUS__", status)
-        .replace("__BANNER__", banner)
-        .replace("__PENDING__", str(pending))
-        .replace("__PROC__", str(processing))
-        .replace("__DONE__", str(done))
-        .replace("__FAIL__", str(failed))
-        .replace("__FAIL_CLASS__", "bad" if failed else "")
-        .replace("__LEAD_ROWS__", lead_rows)
-        .replace("__EVENTS__", evts)
-        .replace("__DETAIL__", detail)
+    evts = (
+        "".join(_event_row(event) for event in reversed(events.tail(12)))
+        or "<tr><td colspan='5' class='mute'>还没有事件</td></tr>"
     )
+
+    page = _fill(
+        _DASHBOARD,
+        {
+            "STATUS": status,
+            "BANNER": banner,
+            "PENDING": str(pending),
+            "PROC": str(processing),
+            "DONE": str(done),
+            "FAIL": str(failed),
+            "FAIL_CLASS": "bad" if failed else "",
+            "LEAD_ROWS": lead_rows,
+            "EVENTS": evts,
+            "DETAIL": detail,
+            "RULES": (
+                _kv("核对", "写回前比对客户、任务、行号与指纹")
+                + _kv("不一致", "本批不写入，行标为异常，服务进入暂停")
+                + _kv("可写列", "analysis / lead_level / source_url / verified_time")
+            ),
+        },
+    )
+    return HTMLResponse(page, headers=_DASHBOARD_HEADERS)
