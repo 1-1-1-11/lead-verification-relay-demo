@@ -5,4 +5,15 @@ venv/
 artifacts/
 data/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
 .DS_Store
+
+.env
+.env.*
+!.env.example
